@@ -1,6 +1,15 @@
 #!/bin/bash
 set -e
 
+# === DATABASE_URL parsing ===
+# DATABASE_URL format: http(s)://host:port/dbname
+if [ -n "$DATABASE_URL" ]; then
+  # Strip the database name (last path segment) to get COUCHDB_URL
+  export COUCHDB_URL="${DATABASE_URL%/*}"
+  # Extract the database name
+  export COUCHDB_NAME="${DATABASE_URL##*/}"
+fi
+
 # === OSC Public URL Configuration ===
 if [ -n "$OSC_HOSTNAME" ]; then
   export PUBLIC_URL="https://$OSC_HOSTNAME"
