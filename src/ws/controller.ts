@@ -67,7 +67,7 @@ const PipZoneSchema = z.object({
   rect: z.object({ x: z.number(), y: z.number(), w: z.number(), h: z.number() }).nullable(),
   capacity: z.number().nullable(),
   sources: z.array(z.number().int().min(0).max(15)),
-  border: z.object({ color: z.string().max(9), width: z.number().min(0).max(64) }).nullish(),
+  border: z.object({ color: z.string().regex(/^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/, 'Must be #RRGGBB or #RRGGBBAA'), width: z.number().int().min(0).max(64) }).nullish(),
 });
 
 const InboundMessageSchema = z.discriminatedUnion('type', [
@@ -749,12 +749,20 @@ async function handleMessage(
       break;
     }
     case 'GO_LIVE': {
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
       const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'ON_AIR', value: true });
       break;
     }
     case 'CUT_STREAM': {
+      if (!doc.stromFlowId) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Production is not activated' }));
+        break;
+      }
       const updated: ProductionDoc = { ...doc, status: 'active', updatedAt: new Date().toISOString() };
       await db.insert(updated);
       broadcast(productionId, { type: 'ON_AIR', value: false });
@@ -762,6 +770,11 @@ async function handleMessage(
     }
     case 'GRAPHIC_ON':
     case 'GRAPHIC_OFF': {
+      const graphic = doc.graphics.find((g) => g.id === msg.overlayId);
+      if (!graphic) {
+        ws.send(JSON.stringify({ type: 'ERROR', error: 'Overlay not found' }));
+        break;
+      }
       const active = msg.type === 'GRAPHIC_ON';
       const updated: ProductionDoc = {
         ...doc,

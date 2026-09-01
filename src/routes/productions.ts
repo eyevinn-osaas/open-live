@@ -281,7 +281,7 @@ async function runActivationFlow(
 
     // Best-effort flow cleanup
     if (stromFlowId) {
-      const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
+      const stromToken = await getStromToken(config.stromToken).catch((err) => { log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
       const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
       await deactivateStromFlow(stromFlowId, strom).catch(() => undefined);
     }
@@ -309,11 +309,11 @@ async function runActivationFlow(
 // ---------------------------------------------------------------------------
 
 const ProductionInput = z.object({
-  name: z.string().min(1),
+  name: z.string().min(1).max(256),
 });
 
 const ProductionPatch = z.object({
-  name: z.string().min(1).optional(),
+  name: z.string().min(1).max(256).optional(),
   values: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
   airTime: z.string().datetime().nullable().optional(),
 });
@@ -530,9 +530,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
         _rev: insertResponse.rev,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to initiate production activation');
-      return reply.status(500).send({ error: message, statusCode: 500 });
+      req.log.error({ err }, 'Activation failed');
+      return reply.status(500).send({ error: 'Activation failed — check server logs', statusCode: 500 });
     }
   });
 
@@ -558,7 +557,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       broadcast(doc._id, { type: 'GRP_STATE_RESET' });
       broadcast(doc._id, { type: 'PRODUCTION_DEACTIVATED' });
       if (doc.stromFlowId) {
-        const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ err }, "SAT exchange failed — proceeding without auth"); return undefined; });
+        const stromToken = await getStromToken(config.stromToken).catch((err) => { req.log.error({ errMsg: err instanceof Error ? err.message : String(err) }, "SAT exchange failed — proceeding without auth"); return undefined; });
         const strom = new StromClient({ baseUrl: config.stromUrl, token: stromToken });
         await deactivateStromFlow(doc.stromFlowId, strom);
       }
@@ -584,9 +583,8 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       notifyProductionDeactivated(doc._id);
       return reply.send({ id: updated._id, name: updated.name, status: updated.status, _rev: response.rev });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      fastify.log.error({ err }, 'Failed to deactivate production');
-      return reply.status(500).send({ error: message, statusCode: 500 });
+      req.log.error({ err }, 'Deactivation failed');
+      return reply.status(500).send({ error: 'Deactivation failed — check server logs', statusCode: 500 });
     }
   });
 
