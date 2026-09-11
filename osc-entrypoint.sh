@@ -20,5 +20,13 @@ fi
 # === Default PORT for OSC ===
 export PORT="${PORT:-8080}"
 
+# === External auth acknowledgement ===
+# The published OSC service schema has no API_KEY config option, so API_KEY is
+# never set on OSC-hosted instances. OSC's own reverse proxy is the external
+# auth layer in front of every instance, so acknowledge that by default here
+# rather than relying on NODE_ENV (which is always "production" on OSC and
+# says nothing about auth architecture). See Eyevinn/open-live#234.
+export TRUST_EXTERNAL_AUTH="${TRUST_EXTERNAL_AUTH:-true}"
+
 # === Execute the original command ===
 exec "$@"
