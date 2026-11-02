@@ -28,7 +28,12 @@ import { upsertRecordingDoc } from '../lib/recording-registry.js';
 import { resolveRecordingUploadTarget } from '../lib/recording-upload-target.js';
 import { startLiveRecordingUpload, stopLiveRecordingUpload, type LiveRecordingSession } from '../services/live-recording-upload.js';
 import { holdRecorderEvents, type RecorderEventsHold } from '../services/strom-recorder-events.js';
-import { isIntercomEnabled, teardownIntercomProduction } from '../lib/intercom-manager.js';
+import {
+  isIntercomEnabled,
+  IntercomManagerError,
+  sweepTalkbackSessions,
+  teardownIntercomProduction,
+} from '../lib/intercom-manager.js';
 import { getIdleSince, getIdleExpiresAt, notifyProductionActivated, notifyProductionDeactivated } from '../services/idle-watchdog.js';
 import { buildProductionStatusEvent, deriveOutputSnapshot, stoppedStatus, type OutputStatusEntry } from '../lib/production-health.js';
 import { settleOnStop, preserveGpuUsageOnDelete } from '../services/gpu-usage.js';
@@ -476,6 +481,39 @@ async function uploadProductionRecording(
 }
 
 /**
+ * Uploads the recording of the activation `doc` describes, before its Strom
+ * flow is torn down (issue #41, #534). Shared by the explicit deactivate and
+ * the idle auto-deactivate (issue #596), so both stop paths upload the same
+ * way. Returns undefined when the activation ran no recorder. Never throws.
+ *
+ * On the Live Recorder path the flow is stopped first: that finalises every
+ * open file, so there is nothing to split (spec §5.4), and the caller's
+ * `deactivateStromFlow` stop that follows is a no-op. Callers must not write
+ * the production doc before this returns (the #366 `_rev` guard).
+ */
+export async function uploadRecordingBeforeTeardown(
+  doc: ProductionDoc,
+  strom: StromClient,
+  stromToken: string | undefined,
+  log: FastifyBaseLogger,
+  liveSession?: LiveRecordingSession,
+): Promise<RecordingUploadSummary | undefined> {
+  if (!doc.stromFlowId || !doc.recorderBlockId) return undefined;
+  // Absent on a production activated before OL-32a: that one runs builtin.recorder.
+  const recorderType: RecorderType = doc.recorderType ?? 'recorder';
+  if (recorderType === 'liverecorder') {
+    try {
+      await strom.flows.stop(doc.stromFlowId);
+    } catch (err) {
+      log.warn({ err, productionId: doc._id }, 'Strom flow stop before the recording upload failed — uploading what is on Strom');
+    }
+  }
+  return uploadProductionRecording(
+    doc, doc.stromFlowId, doc.recorderBlockId, recorderType, strom, stromToken, log, liveSession,
+  );
+}
+
+/**
  * The input recording directories under `recordings/<productionId>/` (OL-32,
  * spec §5.4), by numeric pad index: every `<mixerInput>` subdirectory Strom
  * lists, plus the ones this activation recorded in case the listing fails.
@@ -759,9 +797,9 @@ async function runActivationFlow(
       ...(mixerBlockId !== undefined && { mixerBlockId }),
       ...(audioMixerBlockId !== undefined && { audioMixerBlockId }),
       ...(loudnessMainBlockId !== undefined && { loudnessMainBlockId }),
-      ...(activation.recorderBlockId !== undefined && { recorderBlockId: activation.recorderBlockId }),
-      // Written with recorderBlockId, as undefined without a recorder so a
-      // stale value from an earlier activation never leaks into this one.
+      // Always written, as undefined without a recorder, so a stale value from
+      // an earlier activation never leaks into this one.
+      recorderBlockId: activation.recorderBlockId,
       recorderType: activation.recorderBlockId !== undefined ? activation.recorderType ?? 'recorder' : undefined,
       // The inputs recorded to their own files (OL-32); undefined when none, so
       // a stale list from an earlier activation never leaks into this one.
@@ -1017,6 +1055,9 @@ async function runActivationFlow(
       pgmWhepEndpoint: undefined,
       whipEndpoints: undefined,
       activationWarnings: undefined,
+      recorderBlockId: undefined,
+      recorderType: undefined,
+      recording: undefined,
       inputRecordings: undefined,
     }).catch((resetErr) => {
       log.error({ resetErr, productionId }, 'Failed to reset production to inactive after activation failure');
@@ -1513,23 +1554,7 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
       // the current segment and upload Strom's local recordings to object
       // storage. Best-effort: a failed upload must not block teardown. The
       // outcome is stored on the production as `lastRecordingUpload` (#534).
-      if (doc.recorderBlockId) {
-        // Absent on a production activated before OL-32a: that one runs builtin.recorder.
-        const recorderType: RecorderType = doc.recorderType ?? 'recorder';
-        if (recorderType === 'liverecorder') {
-          // Live Recorder finalises every open file inside the flow stop, so
-          // stop first and then upload everything; no split-now (spec §5.4).
-          // deactivateStromFlow's own stop below is then a no-op.
-          try {
-            await strom.flows.stop(doc.stromFlowId);
-          } catch (err) {
-            log.warn({ err, productionId: doc._id }, 'Strom flow stop before the recording upload failed — uploading what is on Strom');
-          }
-        }
-        lastRecordingUpload = await uploadProductionRecording(
-          doc, doc.stromFlowId, doc.recorderBlockId, recorderType, strom, stromToken, log, liveSession,
-        );
-      }
+      lastRecordingUpload = await uploadRecordingBeforeTeardown(doc, strom, stromToken, log, liveSession);
 
       await deactivateStromFlow(doc.stromFlowId, strom);
     }
@@ -1537,10 +1562,30 @@ const productionsRoutes: FastifyPluginAsync = async (fastify) => {
     // Tear down the Open Intercom talkback grouping (all its lines) with the
     // production lifecycle (issue #302). Best-effort: a failed teardown must not
     // block deactivation, mirroring the Strom/recording teardown contract.
+    // First end every WHIP/WHEP participant session on its lines — guest and
+    // Studio crew talkback alike (guest-talkback spec §6, issue #600):
+    // intercom-manager v4.1.0 refuses `DELETE /production/:p` with 409 while
+    // any session is active. A 409 left after the sweep is logged and the
+    // manager's reaper takes over.
     if (doc.intercomProductionId && isIntercomEnabled()) {
-      await teardownIntercomProduction(doc.intercomProductionId).catch((err) => {
-        log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
-      });
+      const intercomProductionId = doc.intercomProductionId;
+      await sweepTalkbackSessions(intercomProductionId, log);
+      await teardownIntercomProduction(intercomProductionId).then(
+        () => log.info({ productionId: doc._id, intercomProductionId }, 'intercom production deleted'),
+        (err) => {
+          const status = err instanceof IntercomManagerError ? err.status : undefined;
+          if (status === 404) {
+            log.info({ productionId: doc._id, intercomProductionId }, 'intercom production already gone');
+          } else if (status === 409) {
+            log.warn(
+              { productionId: doc._id, intercomProductionId, status },
+              'intercom teardown refused (409: a talkback session is still active) — the manager reaper takes over; continuing deactivation',
+            );
+          } else {
+            log.warn({ err, productionId: doc._id }, 'intercom teardown failed — continuing deactivation');
+          }
+        },
+      );
     }
 
     // Revoke the production's outstanding guest invites and mark any live guest

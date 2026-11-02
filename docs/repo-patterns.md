@@ -177,9 +177,14 @@ An `outputType: 'rtmp'` destination keeps its ingest URL + key in the structured
 never in `url`. Keep `'rtmp'` out of `SRT_OUTPUT_TYPES` so the derived `connect` field
 (`outputs.ts`) is never computed from a key-bearing URL, and skip the SRT listener port-lease
 branch for it (RTMP is an outbound connect, not a listener). The stream key is decrypted and
-composed into `rtmp_url` **only** in the flow generator at activation time, never persisted
-composed, and only ever logged through `safeFlowProjection()` (which strips all block
-properties).
+composed into the `builtin.rtmp_output` block's `location` property **only** in the flow
+generator at activation time, never persisted composed, and only ever logged through
+`safeFlowProjection()` (which strips all block properties). Strom's `builtin.rtmp_output`
+(Eyevinn/strom `backend/src/blocks/builtin/rtmp.rs`, Strom#827) takes its URL as `location` and
+has exactly two input pads, `video_in` (H.264) and `audio_in` (raw or AAC) — **not**
+`audio_in_0` like `builtin.mpegtssrt_output`. An unknown property is silently ignored (the block
+falls back to its loopback default URL), while a wrong pad name fails flow start with
+`External pad '…' not found` (issue #612).
 
 ## A rejected Strom `/transition` must roll back the whole switch, not just the PiP announce
 
@@ -593,3 +598,33 @@ poll registered last. Fakes that tick a poll must keep intervals by id and pick 
 want by function name (`fn.name === 'pollReturnMode'`), as `guest-page-return-mode.test.ts`
 and `guest-page-on-air.test.ts` do. The on-air answer (`GET …/session/status`) is the guest's own
 `{ onAir }` boolean only — never widen it with other tally fields; the guest is untrusted.
+
+## Writing a CouchDB doc twice in one request: carry the `_rev` from the first write
+
+`nano`'s `insert` of an existing doc needs that doc's current `_rev`; a missing or stale one is a
+`409 conflict`. Guest join wrote the session, then wrote it again to add `intercomLineId`,
+without taking the `rev` the first `insert` returned. Every join with a talkback line would have
+hit the 409 on real CouchDB, but test mocks that accept any write hid it (found in #598). When a
+handler writes the same doc twice, set `_rev` from the first `insert`'s result. A mock DB that a
+test relies on for a multi-write flow should enforce revisions, as
+`guests-intercom.test.ts`'s sessions mock does.
+
+## intercom-manager line routes answer with the whole production's line list
+
+`GET` and `POST /production/:p/line` on Eyevinn/intercom-manager both return `LineResponse[]`
+(every line of the production), never the created line alone, and a duplicate line name on
+`POST` is a `400 { message }`. `INTERCOM_MANAGER_URL` must include `/api/v1`. Pick lines out of
+the array by `name`, and test with these real shapes, not an invented `{ id, name, joinUrl }`
+object (#598, `docs/specs/guest-talkback.md` §3.1).
+
+## Proxying intercom-manager WHIP/WHEP: own fetch, own SDP parser, log-capture seam
+
+The talkback proxy (#599) cannot reuse `intercom-manager.ts`'s `request()`: it forces JSON and
+parses the body, but SDP must pass through untouched and the raw `Location`/`ETag`/`Retry-After`
+headers are needed. Use `postTalkbackOffer` / `deleteTalkbackSession` there, and
+`talkbackAuthorization()` for the Bearer (SAT in `osc` mode via `managerBearer()`, else
+`INTERCOM_WHIP_AUTH_KEY`, else none). Never forward the manager's `Link` header (TURN creds).
+Fastify content-type parsers are scoped to the plugin that registers them, so `guests.ts` has its
+own `application/sdp` parser (with the 64 KiB `bodyLimit`) next to the ones in `whip.ts` and
+`returns.ts`. To assert something never reaches the logs, build the server with
+`buildServer({ logStream })` and inspect the captured lines (`guests-talkback.test.ts`).

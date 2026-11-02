@@ -10,7 +10,7 @@ import type { FastifyPluginAsync } from 'fastify';
  * sits in the URL fragment so it never reaches server or proxy access logs. The
  * page reads it from `location.hash`, calls `POST /api/v1/guests/:inviteId/join`
  * with it as a bearer token, publishes camera+mic to the returned `whipUrl`
- * (WHIP), and plays the return feed from `feeds[].url` (WHEP). Once live, the
+ * (WHIP), and plays the return feeds from `feeds[].url` (WHEP). Once live, the
  * guest picks what they hear (program minus themselves, or full program) with
  * `PUT …/session/return`, and the page polls `GET …/session/return` so a change
  * the crew makes shows up here too. While live it also polls
@@ -19,6 +19,19 @@ import type { FastifyPluginAsync } from 'fastify';
  * WHIP, e.g. an SRT encoder) the page never asks for a camera or microphone and
  * only plays the return; it learns which from `GET /api/v1/guests/:inviteId/slot`
  * before touching any device.
+ *
+ * When the join lists a `fast` feed and the mode is `program-minus`, the guest
+ * hears the fast feed's audio and sees the picture feed's video with the
+ * picture's own audio muted. The fast feed is always mix-minus, so in `program`
+ * the guest hears the picture's audio instead. The two feeds stay on separate
+ * PeerConnections so the browser cannot lip-sync the fast audio back to the
+ * picture.
+ *
+ * When join returns `talkback: { whipUrl?, whepUrl }` (an Open Intercom line was
+ * provisioned, issue #601), the page connects talkback with the producer once
+ * live: WHEP to listen, then WHIP to answer with a clone of the mic behind a
+ * "Talk to producer" latch (default off). A return-only slot only listens.
+ * Talkback is a side channel: its failures never touch the publish or returns.
  *
  * This route is a plain static HTML document (no build step): the whole page is
  * embedded as a string constant so the `tsc`-only build carries it into `dist/`
@@ -32,8 +45,8 @@ import type { FastifyPluginAsync } from 'fastify';
 // (`default-src 'none'`) is meant for the JSON API and would block this page's
 // own inline script/style and its media playback, so we override it here to the
 // minimum this page needs: same-origin everything, inline script/style for the
-// self-contained document, blob:/mediastream: media for the WebRTC <video>
-// elements, and same-origin connect for the join/WHIP/WHEP fetches (WebRTC ICE
+// self-contained document, blob:/mediastream: media for the WebRTC <video> and
+// <audio> elements, and same-origin connect for the join/WHIP/WHEP fetches (WebRTC ICE
 // itself is not governed by connect-src).
 const GUEST_PAGE_CSP = [
   "default-src 'self'",
@@ -136,6 +149,9 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       margin-top: 8px; padding: 10px 12px; border-radius: 8px; font-size: 13px;
       background: #3a2e13; border: 1px solid #f08c00;
     }
+    #talkback { margin-top: 16px; border: 1px solid #33333d; border-radius: 10px; padding: 10px 14px; }
+    #talk { width: 100%; background: #495057; }
+    #talk.on { background: #e67700; }
     .hidden { display: none !important; }
   </style>
 </head>
@@ -153,6 +169,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       <video id="preview" autoplay playsinline muted></video>
       <div id="preview-hint" class="hint">This is your camera preview. It is muted here so you don't hear yourself.</div>
       <video id="return" autoplay playsinline class="hidden"></video>
+      <audio id="return-audio" autoplay></audio>
     </div>
     <!-- Outside .videos so a bottom-corner inset sits on the return video, not on this hint. -->
     <div id="return-hint" class="hint hidden">Return feed from the studio.</div>
@@ -211,6 +228,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var preview = document.getElementById("preview");
     var previewHint = document.getElementById("preview-hint");
     var returnVideo = document.getElementById("return");
+    var returnAudio = document.getElementById("return-audio");
     var returnHint = document.getElementById("return-hint");
     var videosBox = document.getElementById("videos");
     var pipOption = document.getElementById("pip-option");
@@ -238,6 +256,34 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
     var publishPc = null;
     var publishResource = null;
     var returnPc = null;
+    var returnResource = null;
+    var fastPc = null;
+    var fastResource = null;
+    // Talkback with the producer (guest-talkback spec §5.1, issue #601): join's
+    // talkback { whipUrl?, whepUrl }, a listen (WHEP) and an answer (WHIP)
+    // connection, each with its server resource, and the talkback sender with
+    // its track, a clone of the program mic so talkback never follows the
+    // program mute. talking is the "Talk to producer" latch (default off).
+    // talkbackGen counts starts and stops, so an answer from an older start is
+    // dropped. One retry per Go live / Rejoin; a 401 stops for good.
+    var talkback = null;
+    var talkbackGen = 0;
+    var talkbackListenPc = null;
+    var talkbackListenResource = null;
+    var talkbackSendPc = null;
+    var talkbackSendResource = null;
+    var talkbackSender = null;
+    var talkbackTrack = null;
+    var talking = false;
+    var talkbackRetried = false;
+    var talkbackRetryTimer = null;
+    var TALKBACK_RETRY_MS = 5000;
+    // The talkback controls, created only when join offers talkback.
+    var talkbackUi = null;
+    // Whether a fast feed is listed and has not failed, and the mode whose audio
+    // is playing. routeReturnAudio picks what the guest hears from these.
+    var fastAvailable = false;
+    var audioMode = "program-minus";
     var muted = false;
     var live = false;
     var left = false;
@@ -380,12 +426,23 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       return c;
     }
 
+    // Echo cancellation is requested explicitly (docs/repo-patterns.md, "Echo
+    // cancellation must be explicitly requested"): talkback from the producer
+    // plays from the guest's speakers next to the program mic (guest-talkback
+    // spec §5.1, R1). noiseSuppression/autoGainControl keep the browser
+    // defaults, so the on-air sound does not change.
+    function audioConstraints(micId) {
+      var c = { echoCancellation: true };
+      if (micId) c.deviceId = { exact: micId };
+      return c;
+    }
+
     function selectedConstraints() {
       var camId = camSel.value;
       var micId = micSel.value;
       return {
         video: videoConstraints(camId),
-        audio: micId ? { deviceId: { exact: micId } } : true
+        audio: audioConstraints(micId)
       };
     }
 
@@ -509,12 +566,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       var seq = ++deviceSeq[kind];
       var sel = kind === "audio" ? micSel : camSel;
       var exact = {};
-      exact[kind] = kind === "video" ? videoConstraints(sel.value) : (sel.value ? { deviceId: { exact: sel.value } } : true);
+      exact[kind] = kind === "video" ? videoConstraints(sel.value) : audioConstraints(sel.value);
       return navigator.mediaDevices.getUserMedia(exact).catch(function (err) {
         // The picked device may be the one that went away: take the default.
         if (!sel.value) throw err;
         var any = {};
-        any[kind] = kind === "video" ? videoConstraints(null) : true;
+        any[kind] = kind === "video" ? videoConstraints(null) : audioConstraints(null);
         return navigator.mediaDevices.getUserMedia(any);
       }).then(function (stream) {
         var fresh = stream.getTracks().filter(function (t) { return t.kind === kind; })[0];
@@ -543,6 +600,7 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           if (old) old.stop();
           watchTrack(fresh);
           applyMuteToTrack();
+          if (kind === "audio") swapTalkbackTrack(fresh);
           trackEnded[kind] = false;
           trackMuted[kind] = !!fresh.muted;
           reconnectFailed[kind] = false;
@@ -743,13 +801,12 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       });
     }
 
-    function whepPlay(url) {
-      var pc = newPeerConnection();
-      pc.addTransceiver("video", { direction: "recvonly" });
-      pc.addTransceiver("audio", { direction: "recvonly" });
-      pc.addEventListener("track", function (e) {
-        if (e.streams && e.streams[0]) returnVideo.srcObject = e.streams[0];
-      });
+    // Non-trickle WHIP/WHEP offer/answer on pc: gather ICE, POST the offer to
+    // url, apply the answer. Resolves with the server resource (Location). On
+    // failure pc is closed, a resource already made is DELETEd, and the error
+    // carries the HTTP status and Retry-After, if any.
+    function negotiate(pc, url, what) {
+      var resource = null;
       return pc.createOffer().then(function (offer) {
         return pc.setLocalDescription(offer);
       }).then(function () {
@@ -761,25 +818,358 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
           body: pc.localDescription.sdp
         });
       }).then(function (res) {
-        if (!res.ok) throw new Error("WHEP play failed: " + res.status);
+        if (!res.ok) {
+          var err = new Error(what + " failed: " + res.status);
+          err.status = res.status;
+          err.retryAfter = res.headers.get("Retry-After");
+          throw err;
+        }
+        resource = res.headers.get("Location");
         return res.text();
       }).then(function (answer) {
         return pc.setRemoteDescription({ type: "answer", sdp: answer });
       }).then(function () {
-        returnPc = pc;
-        returnLost = false;
-        watchReturnConnection(pc);
-        show(returnVideo);
-        show(returnHint);
-        applyPipLayout();
+        return resource;
+      }, function (err) {
+        closeWhep(pc, resource);
+        throw err;
       });
     }
 
+    // Open a recvonly WHEP session and hand its stream to onStream. Resolves
+    // with { pc, resource } once the answer is applied. With wrapTrack, a
+    // track the answer gives no stream for is wrapped in one of its own (an
+    // audio-only server such as intercom-manager may send no msid).
+    function whepPlay(url, withVideo, onStream, wrapTrack) {
+      var pc = newPeerConnection();
+      if (withVideo) pc.addTransceiver("video", { direction: "recvonly" });
+      pc.addTransceiver("audio", { direction: "recvonly" });
+      pc.addEventListener("track", function (e) {
+        if (e.streams && e.streams[0]) onStream(e.streams[0]);
+        else if (wrapTrack && e.track) onStream(new MediaStream([e.track]));
+      });
+      return negotiate(pc, url, "WHEP play").then(function (resource) {
+        return { pc: pc, resource: resource };
+      });
+    }
+
+    function findFeed(feeds, id) {
+      for (var i = 0; i < feeds.length; i++) {
+        if (feeds[i].id === id && feeds[i].url) return feeds[i];
+      }
+      return null;
+    }
+
+    // Play the picture feed, and the fast feed when there is one.
+    function playReturns(feeds, mode) {
+      var picture = findFeed(feeds, "picture");
+      var fast = findFeed(feeds, "fast");
+      fastAvailable = !!fast;
+      routeReturnAudio(mode);
+      if (picture) {
+        whepPlay(picture.url, true, function (stream) { returnVideo.srcObject = stream; }).then(function (s) {
+          if (!live) { closeWhep(s.pc, s.resource); return; }
+          returnPc = s.pc;
+          returnResource = s.resource;
+          returnLost = false;
+          watchReturnConnection(s.pc);
+          show(returnVideo);
+          show(returnHint);
+          applyPipLayout();
+        }).catch(function () {
+          returnHint.textContent = "Return feed not available yet.";
+          show(returnHint);
+        });
+      }
+      if (fast) {
+        whepPlay(fast.url, false, function (stream) { returnAudio.srcObject = stream; }).then(function (s) {
+          if (!live) { closeWhep(s.pc, s.resource); return; }
+          fastPc = s.pc;
+          fastResource = s.resource;
+        }).catch(function () {
+          fastAvailable = false;
+          routeReturnAudio(audioMode);
+        });
+      }
+    }
+
+    // Close a WHEP PeerConnection and ask the server to end its session. The
+    // DELETE must go out before the guest session's own DELETE, since the
+    // invite token stops authorizing return routes once the session is gone.
+    function closeWhep(pc, resource) {
+      if (pc) { try { pc.close(); } catch (e) {} }
+      if (!resource) return;
+      try {
+        fetch(new URL(resource, apiBase).toString(), {
+          method: "DELETE",
+          headers: { "Authorization": "Bearer " + token },
+          keepalive: true
+        }).catch(function () {});
+      } catch (e) {}
+    }
+
+    function closeReturns() {
+      closeWhep(returnPc, returnResource);
+      closeWhep(fastPc, fastResource);
+      returnPc = returnResource = fastPc = fastResource = null;
+      returnVideo.srcObject = null;
+      returnAudio.srcObject = null;
+    }
+
+    // ---- Talkback -----------------------------------------------------------
+    // Talkback with the producer over Open Intercom (guest-talkback spec §5.1).
+    // It is a side channel: nothing here touches the program publish, its
+    // senders or the return feeds, and a failure only hides the talk control.
+    // The guest listens over WHEP and, on a WHIP slot, answers over WHIP with a
+    // clone of the program mic, disabled until "Talk to producer" is on. A
+    // return-only slot only listens, and never opens a device for it.
+    function buildTalkbackUi() {
+      if (talkbackUi) return talkbackUi;
+      var box = document.createElement("div");
+      box.id = "talkback";
+      var title = document.createElement("div");
+      title.className = "hint";
+      title.textContent = "Talkback with the producer";
+      var talkBtn = document.createElement("button");
+      talkBtn.id = "talk";
+      talkBtn.textContent = "Talk to producer";
+      talkBtn.setAttribute("aria-pressed", "false");
+      talkBtn.classList.add("hidden");
+      var status = document.createElement("div");
+      status.id = "talk-status";
+      status.className = "hint";
+      status.textContent = "Producer can hear you";
+      status.classList.add("hidden");
+      var headphones = document.createElement("div");
+      headphones.id = "talkback-headphones";
+      headphones.className = "hint";
+      headphones.textContent = "Use headphones for the best sound";
+      headphones.classList.add("hidden");
+      var unavailable = document.createElement("div");
+      unavailable.id = "talkback-unavailable";
+      unavailable.className = "hint";
+      unavailable.textContent = "Talkback to the producer is unavailable";
+      unavailable.classList.add("hidden");
+      var audio = document.createElement("audio");
+      audio.id = "talkback-audio";
+      audio.autoplay = true;
+      audio.setAttribute("autoplay", "");
+      audio.setAttribute("playsinline", "");
+      [title, talkBtn, status, headphones, unavailable, audio].forEach(function (c) { box.appendChild(c); });
+      talkBtn.addEventListener("click", function () { setTalking(!talking); });
+      pickers.parentNode.insertBefore(box, pickers);
+      talkbackUi = { box: box, talkBtn: talkBtn, status: status, headphones: headphones, unavailable: unavailable, audio: audio };
+      return talkbackUi;
+    }
+
+    function removeTalkbackUi() {
+      if (!talkbackUi) return;
+      talkbackUi.audio.srcObject = null;
+      if (talkbackUi.box.parentNode) talkbackUi.box.parentNode.removeChild(talkbackUi.box);
+      talkbackUi = null;
+    }
+
+    // The "Talk to producer" latch. Off sends silence (the track stays on the
+    // connection, disabled), so the guest does not take dominant speaker.
+    // Independent of the program mute both ways.
+    function setTalking(next) {
+      talking = !!next;
+      if (talkbackTrack) talkbackTrack.enabled = talking;
+      if (!talkbackUi) return;
+      talkbackUi.talkBtn.setAttribute("aria-pressed", talking ? "true" : "false");
+      if (talking) {
+        talkbackUi.talkBtn.classList.add("on");
+        show(talkbackUi.status);
+      } else {
+        talkbackUi.talkBtn.classList.remove("on");
+        hide(talkbackUi.status);
+      }
+    }
+
+    // Starts talkback once live, if join offered it. Called after Go live and
+    // after Rejoin; any earlier talkback is closed first.
+    function startTalkback(info) {
+      stopTalkback();
+      if (!info || !info.whepUrl || !live || left) return;
+      talkback = info;
+      talkbackRetried = false;
+      buildTalkbackUi();
+      connectTalkback();
+    }
+
+    // Opens what is missing: listen (WHEP) first, then answer (WHIP), so the
+    // guest hears the producer even if answering fails.
+    function connectTalkback() {
+      var gen = talkbackGen;
+      var listen = talkbackListenPc ? Promise.resolve() : openTalkbackListen(gen).catch(function (err) {
+        if (gen === talkbackGen) onTalkbackFailed("whep", err);
+        throw err;
+      });
+      listen.then(function () {
+        if (gen !== talkbackGen || !talkback || !talkback.whipUrl || talkbackSendPc) return;
+        return openTalkbackSend(gen).catch(function (err) {
+          if (gen === talkbackGen) onTalkbackFailed("whip", err);
+        });
+      }).catch(function () { /* handled above */ });
+    }
+
+    function openTalkbackListen(gen) {
+      var ui = talkbackUi;
+      return whepPlay(talkback.whepUrl, false, function (stream) {
+        if (gen === talkbackGen && ui) ui.audio.srcObject = stream;
+      }, true).then(function (s) {
+        if (gen !== talkbackGen || !live || left) { closeWhep(s.pc, s.resource); return; }
+        talkbackListenPc = s.pc;
+        talkbackListenResource = s.resource;
+        watchTalkbackConnection(s.pc, "whep");
+        show(ui.headphones);
+        if (!talkback.whipUrl) hide(ui.unavailable);
+      });
+    }
+
+    function openTalkbackSend(gen) {
+      var mic = trackOf("audio");
+      // A WHIP slot always has the mic open by now; never prompt for one here.
+      if (!mic || !mic.clone) return Promise.reject(new Error("no microphone for talkback"));
+      var pc = newPeerConnection();
+      var clone = mic.clone();
+      clone.enabled = false;
+      var tx;
+      try {
+        tx = pc.addTransceiver(clone, { direction: "sendonly" });
+      } catch (e) {
+        clone.stop();
+        try { pc.close(); } catch (e2) {}
+        return Promise.reject(e);
+      }
+      return negotiate(pc, talkback.whipUrl, "Talkback WHIP").then(function (resource) {
+        if (gen !== talkbackGen || !live || left) {
+          clone.stop();
+          closeWhep(pc, resource);
+          return;
+        }
+        talkbackSendPc = pc;
+        talkbackSendResource = resource;
+        talkbackSender = tx.sender;
+        talkbackTrack = clone;
+        watchTalkbackConnection(pc, "whip");
+        setTalking(false);
+        hide(talkbackUi.unavailable);
+        show(talkbackUi.talkBtn);
+      }, function (err) {
+        clone.stop();
+        throw err;
+      });
+    }
+
+    function watchTalkbackConnection(pc, kind) {
+      if (!pc.addEventListener) return;
+      pc.addEventListener("connectionstatechange", function () {
+        if (left || pc.connectionState !== "failed") return;
+        if (pc !== talkbackListenPc && pc !== talkbackSendPc) return;
+        onTalkbackFailed(kind, null);
+      });
+    }
+
+    function closeTalkbackSend() {
+      closeWhep(talkbackSendPc, talkbackSendResource);
+      if (talkbackTrack) talkbackTrack.stop();
+      talkbackSendPc = talkbackSendResource = talkbackSender = talkbackTrack = null;
+      talking = false;
+      if (talkbackUi) {
+        setTalking(false);
+        hide(talkbackUi.talkBtn);
+      }
+    }
+
+    function closeTalkbackListen() {
+      closeWhep(talkbackListenPc, talkbackListenResource);
+      talkbackListenPc = talkbackListenResource = null;
+      if (talkbackUi) {
+        talkbackUi.audio.srcObject = null;
+        hide(talkbackUi.headphones);
+      }
+    }
+
+    // A talkback connection failed, or its POST errored. Losing the listen
+    // side closes both (answering without hearing the producer makes no
+    // sense); losing the answer side keeps the guest listening. Retries once,
+    // after Retry-After on a 503 (default 5 s); a 401 means the session is gone.
+    function onTalkbackFailed(kind, err) {
+      if (left || !live || !talkback) return;
+      if (kind === "whep") {
+        talkbackGen++;
+        closeTalkbackListen();
+      }
+      closeTalkbackSend();
+      show(talkbackUi.unavailable);
+      var status = err && err.status;
+      if (status === 401) {
+        if (talkbackRetryTimer) { clearTimeout(talkbackRetryTimer); talkbackRetryTimer = null; }
+        talkbackRetried = true;
+        return;
+      }
+      if (talkbackRetried || talkbackRetryTimer) return;
+      talkbackRetried = true;
+      var delay = TALKBACK_RETRY_MS;
+      if (status === 503 && err.retryAfter) {
+        var secs = parseInt(err.retryAfter, 10);
+        if (secs > 0) delay = secs * 1000;
+      }
+      talkbackRetryTimer = setTimeout(function () {
+        talkbackRetryTimer = null;
+        if (live && !left && talkback) connectTalkback();
+      }, delay);
+    }
+
+    // Puts a clone of the new mic on the talkback sender, keeping the latch.
+    function swapTalkbackTrack(fresh) {
+      if (!talkbackSender || !fresh.clone) return;
+      var sender = talkbackSender;
+      var old = talkbackTrack;
+      var clone = fresh.clone();
+      clone.enabled = talking;
+      talkbackTrack = clone;
+      sender.replaceTrack(clone).then(function () {
+        if (old) old.stop();
+      }, function () {
+        clone.stop();
+        if (talkbackTrack === clone) {
+          talkbackTrack = old;
+          if (old) old.enabled = talking;
+        }
+      });
+    }
+
+    // Ends talkback: DELETEs both resources (keepalive, before the guest
+    // session's own DELETE, like closeWhep), closes both connections and
+    // removes the controls.
+    function stopTalkback() {
+      talkbackGen++;
+      if (talkbackRetryTimer) { clearTimeout(talkbackRetryTimer); talkbackRetryTimer = null; }
+      closeTalkbackSend();
+      closeTalkbackListen();
+      talkback = null;
+      removeTalkbackUi();
+    }
+
     // ---- Return mode -------------------------------------------------------
-    // Makes what the guest hears match the mode. Both modes play the picture
-    // feed's audio; the server switches what that audio carries.
+    // Makes what the guest hears match the mode. The server switches what the
+    // picture feed's audio carries; in program-minus with a fast feed the guest
+    // hears the fast feed instead, which arrives about half a second sooner.
+    // The fast feed is always mix-minus, so program, or a fast feed that failed,
+    // plays the picture's audio. A muted fast feed stays connected so switching
+    // back is instant.
+    function routeReturnAudio(mode) {
+      audioMode = mode;
+      var useFast = mode === "program-minus" && fastAvailable;
+      returnVideo.muted = useFast;
+      returnAudio.muted = !useFast;
+    }
+
     function applyReturnAudio(mode) {
       returnMode = mode;
+      routeReturnAudio(mode);
       Object.keys(modeInputs).forEach(function (k) { modeInputs[k].checked = k === mode; });
       updateSelfWarning();
     }
@@ -956,18 +1346,18 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
         updateDeviceAlert();
         startReturnMode(joinData);
         if (joinData.whipUrl) startOnAir();
-        // Play the return feed(s), if any are live yet. Failure here is
-        // non-fatal: the guest is still contributing even without return video.
+        // Play the return feeds, if any are live yet. Failure here is
+        // non-fatal: the guest is still contributing even without a return.
         var feeds = (joinData && joinData.feeds) || [];
-        if (feeds.length && feeds[0].url) {
-          whepPlay(feeds[0].url).catch(function () {
-            returnHint.textContent = "Return feed not available yet.";
-            show(returnHint);
-          });
+        if (feeds.length) {
+          playReturns(feeds, (joinData && (joinData.returnMode || joinData.defaultMode)) || "program-minus");
         } else if (!joinData.whipUrl) {
           returnHint.textContent = "Return feed not available yet. Leave and open the link again once the show is running.";
           show(returnHint);
         }
+        // Talkback with the producer, only when join offers it (a line was
+        // provisioned). Never affects the publish or the return feeds.
+        startTalkback(joinData.talkback);
       });
     }
 
@@ -990,7 +1380,8 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       stopReturnMode();
       stopOnAir();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
-      if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
+      closeReturns();
+      stopTalkback();
       senders = {};
       publishLost = false;
       returnLost = false;
@@ -1031,22 +1422,34 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       stopReturnMode();
       stopOnAir();
       if (publishPc) { try { publishPc.close(); } catch (e) {} publishPc = null; }
-      if (returnPc) { try { returnPc.close(); } catch (e) {} returnPc = null; }
+      closeReturns();
+      stopTalkback();
       if (localStream) { localStream.getTracks().forEach(function (t) { t.stop(); }); }
       // A page restored from the back/forward cache opens the devices afresh.
       localStream = null;
       applyPipLayout();
     }
 
+    // Ends the guest session. Never throws, so Leave and pagehide always finish.
+    function endSession() {
+      try {
+        return fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
+          method: "DELETE",
+          headers: { "Authorization": "Bearer " + token },
+          keepalive: true
+        }).catch(function () {});
+      } catch (e) {
+        return Promise.resolve();
+      }
+    }
+
     function leave() {
       leaveBtn.disabled = true;
       live = false;
       left = true;
-      fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
-        method: "DELETE",
-        headers: { "Authorization": "Bearer " + token },
-        keepalive: true
-      }).catch(function () {}).then(function () {
+      closeReturns();
+      stopTalkback();
+      endSession().then(function () {
         teardown();
         showLeft();
       });
@@ -1068,14 +1471,11 @@ const GUEST_PAGE_HTML = `<!DOCTYPE html>
       // the back/forward cache.
       live = false;
       left = true;
-      // Best-effort teardown on close; keepalive lets the request outlive the page.
-      try {
-        fetch(apiBase + "/api/v1/guests/" + encodeURIComponent(inviteId) + "/session", {
-          method: "DELETE",
-          headers: { "Authorization": "Bearer " + token },
-          keepalive: true
-        });
-      } catch (e) {}
+      // Best-effort teardown on close; keepalive lets the requests outlive the
+      // page. The return feeds' DELETEs are queued first (see closeWhep).
+      closeReturns();
+      stopTalkback();
+      endSession();
       teardown();
       showLeft();
     });

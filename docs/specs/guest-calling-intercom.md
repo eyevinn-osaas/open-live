@@ -313,6 +313,9 @@ included in the connect-time sync:
 | 404  | production / invite / guest not found; no return on that input |
 | 409  | invite expired / capacity reached; production inactive (return feeds) |
 | 502/503 | Strom or intercom-manager unreachable |
+| 404  | `Talkback unavailable` — talkback routes only: intercom off, no line for the guest, or manager 404 ([guest-talkback §3.5](guest-talkback.md#35-error-code-additions)) |
+| 502  | talkback routes only: intercom-manager unreachable, 5xx, or `401` (`INTERCOM_WHIP_AUTH_KEY` mismatch) |
+| 503 + `Retry-After` | talkback routes only: intercom-manager rate limit (`429`) |
 
 ## Data Model
 
@@ -420,6 +423,21 @@ Guest calling is on by default (issue #391): the backend generates its invite-si
 first start and stores it in its own CouchDB (`src/lib/guest-signing-key.ts`), reusing it on
 restart. When intercom vars are unset, guest calling still works with WHIP video + WHEP return but
 no talkback line (feature degrades cleanly — the fallback is first-class by design).
+
+## Talkback client (addendum, issue #593)
+
+This spec covers line *provisioning*. How the guest page and Studio join the line is specified in
+the linked addendum [`guest-talkback.md`](guest-talkback.md) (Proposed), with
+[ADR-012](../decisions/ADR-012-guest-talkback-whip-whep-proxy.md). Once that addendum is accepted,
+it amends this spec in three places:
+
+- **Join no longer returns 502 for intercom.** An intercom-manager failure during provisioning
+  is logged, and join returns `200` without `intercomLine`. This replaces the "502/503 …
+  intercom-manager unreachable" behaviour for join in [Error codes](#error-codes).
+- **`intercomLine.joinUrl` is removed.** intercom-manager returns no join URL. Join instead adds
+  a server-issued `talkback { whipUrl?, whepUrl }` object.
+- **One line per guest slot (`guest-<mixerInput>`), reused on rejoin.** This replaces one line
+  per join named after the invite label.
 
 ## Open Questions
 

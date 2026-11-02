@@ -315,8 +315,8 @@ export const config = {
    * uploads the recorder's local segments to object storage after a production deactivates,
    * fetching them via Strom's existing media download API (`GET /api/media/file/:path`).
    *
-   * When these vars are unset the `recording` output type is rejected at assignment time
-   * (400 — recording disabled), mirroring how STROM_URL / API_KEY degrade cleanly.
+   * Object storage is optional: recording itself needs only Strom. When these vars are
+   * unset, recordings stay on Strom's media path and deactivate skips the upload.
    * `MINIO_ENDPOINT` falls back to `S3_ENDPOINT` for S3-compatible naming. Empty or
    * whitespace-only values count as unset (see `optionalEnv`).
    */
@@ -326,6 +326,12 @@ export const config = {
   minioBucket: optionalEnv('MINIO_BUCKET'),
   minioRegion: optionalEnv('MINIO_REGION') ?? 'us-east-1',
   minioUseSsl: parseBoolEnv('MINIO_USE_SSL', true),
+  /**
+   * Opt-in (default off): accept a `recording` output with no storage target, so
+   * the recording stays on Strom's media path with no upload and no retention.
+   * Without it, such an output is refused with 400.
+   */
+  recordingLocalOnly: parseBoolEnv('RECORDING_LOCAL_ONLY', false),
   /** Optional prefix prepended to every recording object key. */
   recordingKeyPrefix: process.env['RECORDING_KEY_PREFIX'] ?? '',
   /**
@@ -453,17 +459,38 @@ export const config = {
   /** Default guest invite lifetime in seconds. */
   guestInviteTtlS: parsePositiveIntEnv('GUEST_INVITE_TTL_S', 86400),
   /**
-   * Base URL of the Open Intercom manager (Eyevinn/intercom-manager). Optional:
-   * when unset, guest calling still works with WHIP video + WHEP return but no
+   * Base URL of the Open Intercom manager (Eyevinn/intercom-manager), **including
+   * `/api/v1`** (e.g. `https://intercom.example.com/api/v1`). Optional: when
+   * unset, guest calling still works with WHIP video + WHEP return but no
    * talkback line (the fallback is first-class by design — spec §Configuration).
-   * Consumed by a later sub-issue (intercom line provisioning).
    */
   intercomManagerUrl: process.env['INTERCOM_MANAGER_URL'] ?? undefined,
   /**
    * Auth token for the Open Intercom manager. Optional; held server-side only
-   * and redacted in `src/lib/log-redact.ts`. Consumed by a later sub-issue.
+   * and redacted in `src/lib/log-redact.ts`. In `direct` auth mode it is the
+   * manager's `API_KEY`; in `osc` mode it is an OSC Personal Access Token.
    */
   intercomManagerToken: process.env['INTERCOM_MANAGER_TOKEN'] ?? undefined,
+  /**
+   * How `INTERCOM_MANAGER_TOKEN` is used (issue #598, guest-talkback spec OQ3):
+   * - `direct` (default): sent as-is as `Authorization: Bearer <token>`.
+   * - `osc`: the token is an OSC PAT, exchanged for a Service Access Token
+   *   scoped to `eyevinn-intercom-manager` and sent as the Bearer (OSC-hosted,
+   *   SAT-gated manager; leave the instance's `whipAuthKey` unset in that mode).
+   * Any value other than `osc` means `direct`.
+   */
+  intercomManagerAuthMode: (process.env['INTERCOM_MANAGER_AUTH_MODE'] === 'osc' ? 'osc' : 'direct') as
+    | 'osc'
+    | 'direct',
+  /**
+   * Bearer for intercom-manager's per-line WHIP/WHEP endpoints (the manager's
+   * `WHIP_AUTH_KEY`; guest-talkback spec §7, issue #599). Used only by the
+   * talkback proxy in `direct` auth mode; when unset the proxy sends no
+   * `Authorization` (manager WHIP auth off). In `osc` mode the SAT is sent
+   * instead and this is ignored. Held server-side only — never sent to a
+   * browser — and redacted in `src/lib/log-redact.ts` and the logger paths.
+   */
+  intercomWhipAuthKey: process.env['INTERCOM_WHIP_AUTH_KEY'] || undefined,
   // --- Shared-GPU usage metering (issue #500, docs/specs/shared-gpu-usage-metering.md, ADR-005) ---
   /**
    * Shared-GPU pool label (e.g. `se-sto01`) surfaced as the `gpu_pool` label /
@@ -544,15 +571,32 @@ export function isGpuMeteringEnabled(): boolean {
 }
 
 /**
- * True when all required MinIO vars are present, i.e. VOD recording is enabled.
- * The `recording` output type is only accepted, and the recorder block only
- * wired into the flow, when this returns true (spec: config-gated feature).
+ * True when all required MinIO vars are present, i.e. recordings are uploaded to
+ * object storage on deactivate and the VOD listing/playback endpoints are served.
+ * Recording itself does not depend on this: without object storage, Strom's
+ * recorder still writes segments to its media path and they stay there.
  */
-export function isRecordingEnabled(): boolean {
+export function isObjectStorageConfigured(): boolean {
   return Boolean(
     config.minioEndpoint &&
       config.minioAccessKey &&
       config.minioSecretKey &&
       config.minioBucket,
   );
+}
+
+/**
+ * Names of the required MinIO vars that are unset. Empty when object storage is
+ * fully configured or not configured at all (no var set) — a non-empty result
+ * means a partial config, which silently disables upload, so startup warns.
+ */
+export function objectStorageMissingVars(): string[] {
+  const vars: Array<[string, string | undefined]> = [
+    ['MINIO_ENDPOINT', config.minioEndpoint],
+    ['MINIO_ACCESS_KEY', config.minioAccessKey],
+    ['MINIO_SECRET_KEY', config.minioSecretKey],
+    ['MINIO_BUCKET', config.minioBucket],
+  ];
+  const missing = vars.filter(([, v]) => !v).map(([name]) => name);
+  return missing.length === vars.length ? [] : missing;
 }

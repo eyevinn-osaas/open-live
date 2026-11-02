@@ -10,7 +10,7 @@ import { encryptAddressPassphrase, decryptAddressPassphrase } from '../lib/srt-p
 import { encryptStreamKey } from '../lib/rtmp-credentials-crypto.js';
 import { resolveIngestUrl, validateStreamKey } from '../lib/rtmp.js';
 import { resolveSrtConnect } from '../lib/srt-connect.js';
-import { config, isRecordingEnabled } from '../config.js';
+import { config, isObjectStorageConfigured } from '../config.js';
 import { DEFAULT_CONNECTION_ID } from '../lib/storage-connection.js';
 import { isDocNotFoundError } from '../lib/db-errors.js';
 import { getPortReservation } from '../services/port-reservation.js';
@@ -61,7 +61,7 @@ function outputStatusFor(outputId: string, live: Set<string> | null): OutputStat
 /**
  * True if `outputId` is assigned to any active/activating production. Used to
  * block a destructive mutation (delete, or an RTMP key/platform change) while a
- * production is live — the composed rtmp_url is baked into the running flow at
+ * production is live — the composed RTMP URL (`location`) is baked into the running flow at
  * activation time and there is no live-inject primitive, so a change would not
  * take effect until restart and must not silently diverge from what is on air
  * (spec §Error codes 409, ADR-004 security condition 10).
@@ -82,11 +82,12 @@ async function outputInActiveProduction(outputId: string): Promise<boolean> {
 /**
  * Why a `recording` output with this `connectionId` has nowhere to upload to,
  * or null when it does (issue #534). A real connection must exist and name a
- * bucket; no connection (or the reserved `"default"`) needs the MINIO_* env.
+ * bucket; no connection (or the reserved `"default"`) needs the MINIO_* env, or
+ * the default-off `RECORDING_LOCAL_ONLY` opt-in (the recording stays on Strom).
  */
 async function recordingTargetError(connectionId: string | undefined): Promise<string | null> {
   if (!connectionId || connectionId === DEFAULT_CONNECTION_ID) {
-    return isRecordingEnabled()
+    return isObjectStorageConfigured() || config.recordingLocalOnly
       ? null
       : 'Recording needs object storage: set the MINIO_* environment variables or choose a storage connection (connectionId)';
   }
@@ -354,7 +355,7 @@ const outputsRoutes: FastifyPluginAsync = async (fastify) => {
         const mutatesCredential =
           rtmpPatch.platform !== undefined || rtmpPatch.streamKey !== undefined || rtmpPatch.ingestUrl !== undefined;
         // Block key/platform mutation while the destination is live (409) — the
-        // composed rtmp_url is baked into the running flow at activation time and
+        // composed RTMP URL (`location`) is baked into the running flow at activation time and
         // there is no live-inject primitive (ADR-004 security condition 10).
         if (mutatesCredential && (await outputInActiveProduction(doc._id))) {
           return reply.status(409).send({ error: 'Output is used in an active production', statusCode: 409 });
